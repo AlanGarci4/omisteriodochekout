@@ -85,12 +85,12 @@ histogram_quantile(0.95,
 <p>O pool insuficiente foi confirmado como causa da saturação. Foi alterado o ambiente do serviço <code>loja</code> no <code>compose.yaml</code>:</p>
 <pre>Antes: - DB_POOL_SIZE=2
 Depois: - DB_POOL_SIZE=10</pre>
-<p>O valor 10 supera a concorrência observada de oito clientes e permite atender o pico de checkouts sem manter todas as conexões ocupadas.</p>
+<p>O valor 10 foi escolhido porque supera a concorrência observada de oito clientes — ou seja, oferece folga acima do pico identificado, sem afirmar que seja o máximo ideal em qualquer carga futura. A correção deve ser acompanhada por testes e métricas caso o volume da loja aumente.</p>
 <p>Aplicação:</p>
 <pre>docker compose up -d loja</pre>
 
 <h2>7. Prova da correção</h2>
-<p>Após a recriação do serviço e uma nova janela de coleta de dois minutos, cinco novas compras diretas retornaram:</p>
+<p>Os resultados “antes” foram obtidos em uma janela de coleta anterior à recriação da loja. Após recriar o serviço e aguardar uma nova janela de dois minutos, foram feitas cinco compras diretas:</p>
 <pre>200 0.952452s
 200 1.352133s
 200 0.973428s
@@ -98,21 +98,21 @@ Depois: - DB_POOL_SIZE=10</pre>
 200 0.573512s</pre>
 
 <table>
-<tr><th>Indicador</th><th>Antes</th><th>Depois</th><th>Resultado</th></tr>
-<tr><td>Taxa de erro no /checkout</td><td class="bad">29,56%</td><td class="ok">0%</td><td>Sem resultado 5xx na janela pós-correção</td></tr>
-<tr><td>p95 do /checkout</td><td class="bad">4,364 s</td><td class="ok">1,491 s</td><td>Redução para cerca do tempo normal da operação</td></tr>
-<tr><td>Conexões em uso</td><td>2 fixas</td><td>5 no instante medido</td><td>Pool passou a variar, mostrando folga</td></tr>
-<tr><td>Taxa aproximada do checkout</td><td>2,84 req/s</td><td>5,60 req/s</td><td>Aumento por não haver bloqueio e descarte na fila</td></tr>
-<tr><td>p95 de / e /produtos</td><td>48 ms / 206 ms</td><td>48 ms / 215 ms</td><td>Sem regressão relevante</td></tr>
+<tr><th>Indicador medido</th><th>Antes da correção</th><th>Depois da correção</th><th>Resultado na carga testada</th></tr>
+<tr><td>Taxa de erro no /checkout</td><td class="bad">29,56% em uma janela de 1 minuto</td><td class="ok">0%</td><td>Não foram encontrados 5xx na janela pós-correção consultada</td></tr>
+<tr><td>p95 do /checkout</td><td class="bad">4,364 s</td><td class="ok">1,491 s</td><td>Reduziu para cerca do tempo normal da operação, dentro da medição pós-correção</td></tr>
+<tr><td>Conexões em uso</td><td>2 fixas</td><td>5 no instante medido</td><td>Pool passou a variar, indicando folga durante a carga observada</td></tr>
+<tr><td>Taxa aproximada do checkout</td><td>2,84 req/s</td><td>5,60 req/s</td><td>Aumento observado na janela; não havia mais bloqueio e descarte por timeout</td></tr>
+<tr><td>p95 de / e /produtos</td><td>48 ms / 206 ms</td><td>48 ms / 215 ms</td><td>Sem regressão relevante nas demais rotas</td></tr>
 </table>
 
 <h3>Logs após a correção</h3>
 <p>O log <code>timeout ao obter conexão do pool do banco</code> deixou de aparecer na janela pós-correção. Os erros de recomendações e newsletter continuaram existindo, pois não estavam relacionados à causa do incidente.</p>
 
 <h2>8. Conclusão</h2>
-<p><b>Causa raiz:</b> saturação do pool do banco causada por <code>DB_POOL_SIZE=2</code>. Oito clientes concorrentes faziam o checkout esperar em fila; ultrapassados dois segundos, pedidos recebiam 500. Essa espera também elevava o p95 para cerca de 4,364 s.</p>
-<p><b>Correção:</b> elevar o pool para <code>DB_POOL_SIZE=10</code> eliminou a saturação observada.</p>
-<p><b>Prova:</b> a taxa de erro do checkout caiu de aproximadamente 29,56% para 0%, o p95 caiu para aproximadamente 1,491 s, cinco compras consecutivas tiveram status 200 e o valor da métrica de conexões passou a variar em vez de permanecer colado em 2.</p>
+<p><b>Causa raiz:</b> o pool de banco configurado com <code>DB_POOL_SIZE=2</code> ficou saturado pela concorrência de oito clientes. Com todas as duas conexões ocupadas, novos checkouts esperaram na fila. O timeout configurado em 2 segundos fez pedidos desistirem com 500. A fila elevou a latência e explicou o p95 de aproximadamente 4,364 s no /checkout.</p>
+<p><b>Correção:</b> elevar o pool para <code>DB_POOL_SIZE=10</code> eliminou a saturação observada nessa carga, dando folga acima dos oito clientes concorrentes. O valor não é apresentado como ideal universal; ele foi validado especificamente no cenário da prática.</p>
+<p><b>Prova:</b> na carga testada após a correção, não houve erro 5xx do checkout na janela consultada, o p95 medido caiu para aproximadamente 1,491 s e cinco compras consecutivas tiveram status 200. A métrica deixou de ficar colada em 2 e passou a variar. A confirmação conjunta de métricas e logs demonstra que a fila de conexões foi a causa e que a correção resolveu o cenário observado.</p>
 
 <h2>9. Queries utilizadas</h2>
 <pre># Taxa por rota
