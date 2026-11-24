@@ -1,0 +1,77 @@
+services:
+  loja:
+    image: mvalgueiroschool/pratica-misterio-app:1.0.0
+    container_name: loja
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_POOL_SIZE=10
+    labels:
+      logging: "alloy"
+      service: "loja"
+
+  trafego:
+    image: curlimages/curl:8.22.0
+    container_name: trafego
+    entrypoint: ["sh", "/gerar-trafego.sh"]
+    volumes:
+      - ./trafego/gerar-trafego.sh:/gerar-trafego.sh:ro
+    depends_on:
+      - loja
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+
+  loki:
+    image: grafana/loki:3.7.8
+    container_name: loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml
+      - loki-data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.20.1
+    container_name: alloy
+    ports:
+      - "12345:12345"
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_USERS_DEFAULT_LANGUAGE=pt-BR
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning
+    depends_on:
+      - loki
+      - prometheus
+
+volumes:
+  grafana-data:
+  loki-data:
+  prometheus-data:

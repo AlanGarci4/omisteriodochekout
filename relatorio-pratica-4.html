@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Relatório – O Mistério do Checkout</title>
+<style>
+@page { size: A4; margin: 16mm; }
+body { font-family: Arial, sans-serif; color:#222; line-height:1.42; font-size:11pt; }
+h1 { font-size:22pt; margin-bottom:4mm; } h2 { font-size:15pt; margin-top:7mm; border-bottom:1px solid #bbb; padding-bottom:2mm; }
+h3 { font-size:12pt; margin-top:5mm; } code, pre { font-family:"Consolas","Courier New",monospace; }
+pre { background:#f4f6f8; border:1px solid #ddd; padding:3mm; overflow-wrap:anywhere; white-space:pre-wrap; }
+table { width:100%; border-collapse:collapse; margin:3mm 0; } th, td { border:1px solid #bbb; padding:1.5mm; text-align:left; vertical-align:top; }
+th { background:#e9eef5; } .ok { color:#177b35; font-weight:bold; } .bad { color:#b42318; font-weight:bold; }
+.meta { background:#f7f7f7; border-left:4px solid #315d94; padding:3mm; } .small { font-size:9.5pt; }
+.pagebreak { page-break-before:always; }
+</style>
+</head>
+<body>
+<h1>O Mistério do Checkout — Prática 4</h1>
+<div class="meta"><b>Equipe:</b> Alan Garcia, Daniel Arrais, José Gomes, Thiago Sobreira e Túlio Coimbra.<br>
+<b>Atividade:</b> investigação do chamado a partir de métricas e logs, correção e comprovação da resolução.<br>
+<b>Ambiente:</b> Docker Compose local; Grafana, Prometheus, Loki e Alloy.</div>
+
+<h2>1. Resumo do chamado</h2>
+<p>Às 14:07, o suporte informou que clientes não conseguiam finalizar compras desde o deploy do dia. Parte dos usuários relatava lentidão no site. Não havia acesso ao código da loja; a investigação usou o <code>compose.yaml</code>, métricas Prometheus e logs Loki.</p>
+
+<h2>2. Ambiente e reprodução</h2>
+<p>Os contêineres foram iniciados com <code>docker compose up -d</code>. A configuração foi extraída do Gist oficial e organizada na pasta <code>pratica-misterio-checkout</code>. Cinco requisições diretas ao checkout produziram:</p>
+<pre>200 2.755019s
+500 2.065060s
+200 2.985009s
+200 2.348349s</pre>
+<p><b>Evidência:</b> respostas 500 existiam e as respostas bem-sucedidas demoram cerca de 2,3 a 3 segundos, confirmando o problema real.</p>
+
+<h2>3. Investigação com métricas RED</h2>
+<p>As taxas foram consultadas por rota para separar Rate, Errors e Duration.</p>
+<pre>sum by (path) (rate(http_requests_total[1m]))
+sum by (path) (rate(http_requests_total{status=~"5.."}[1m])) /
+sum by (path) (rate(http_requests_total[1m]))
+histogram_quantile(0.95,
+  sum by (le, path) (rate(http_request_duration_seconds_bucket[1m])))</pre>
+
+<table>
+<tr><th>Rota</th><th>Taxa aproximada</th><th>Taxa de erro 5xx</th><th>p95 aproximado</th><th>Diagnóstico</th></tr>
+<tr><td>/</td><td>2,34 req/s</td><td>0</td><td>48 ms</td><td class="ok">Saudável</td></tr>
+<tr><td>/produtos</td><td>2,63 req/s</td><td>0</td><td>206 ms</td><td class="ok">Saudável</td></tr>
+<tr><td>/checkout</td><td>2,84 req/s</td><td class="bad">29,56%</td><td class="bad">4,364 s</td><td class="bad">Rota afetada</td></tr>
+</table>
+<p>Conclusão desta etapa: o problema é específico do checkout. A página inicial e /produtos não apresentavam respostas 500 e mantiveram latências compatíveis com seus tempos normais.</p>
+
+<h2>4. Investigação com logs</h2>
+<p>Primeiro foi usada a consulta ampla e, depois, o filtro apenas por erros da loja:</p>
+<pre>{container=~".+"}
+{service="loja"} | json | level="ERROR"</pre>
+
+<table>
+<tr><th>Mensagem</th><th>Ocorrências na janela analisada</th><th>A origem é o cliente?</th><th>Decisão</th></tr>
+<tr><td>falha ao buscar recomendações</td><td>190</td><td>Não — ocorre no fluxo de produtos</td><td>Descartada como causa principal</td></tr>
+<tr><td>timeout ao obter conexão do pool do banco</td><td>157</td><td>Sim — associado ao checkout</td><td class="bad">Causa provável</td></tr>
+<tr><td>falha ao enviar newsletter</td><td>19</td><td>Não — job interno sem path</td><td>Descartada</td></tr>
+</table>
+<p>A consulta específica de checkout mostrou a evidência relevante:</p>
+<pre>{service="loja"} | json | path="/checkout" | level="ERROR"</pre>
+<p>Um registro continha <code>pool_size: 2</code>, <code>espera_s: 2.0</code>, <code>status: 500</code> e mensagem de timeout ao obter conexão do pool do banco.</p>
+
+<h2 class="pagebreak">5. Juntando métricas e logs</h2>
+<p>A métrica <code>db_conexoes_em_uso</code> ficou colada em <b>2</b>. Porém o número 2 só se tornou suspeito após conferir o pool no log e no <code>compose.yaml</code>: a configuração era <code>DB_POOL_SIZE=2</code>, enquanto existiam oito clientes concorrentes e o tráfego checkout usava aproximadamente 45% das requisições.</p>
+
+<table>
+<tr><th>Evidência</th><th>Interpretação</th></tr>
+<tr><td>Duas conexões em uso constantemente</td><td>Pool saturado.</td></tr>
+<tr><td>Tempo limite de espera de 2 s</td><td>Pedidos que esperavam além desse limite recebiam 500.</td></tr>
+<tr><td>p95 do checkout em 4,364 s</td><td>Parte das requisições esperava na fila antes de ser atendida ou descartada.</td></tr>
+<tr><td>Somente checkout com 5xx</td><td>Ocorre na operação que usa o pool do banco.</td></tr>
+</table>
+
+<h3>Caminhos descartados</h3>
+<ul>
+<li><b>Recomendações:</b> o erro era frequente, mas pertencia a /produtos e essa rota continuava 200 e saudável.</li>
+<li><b>Newsletter:</b> era um job em segundo plano sem requisição HTTP ou rota; não explica respostas 500 no checkout.</li>
+<li><b>Memória:</b> o WARN de memória foi investigado, mas a memória residente real permaneceu estável.</li>
+</ul>
+
+<h2>6. Correção aplicada</h2>
+<p>O pool insuficiente foi confirmado como causa da saturação. Foi alterado o ambiente do serviço <code>loja</code> no <code>compose.yaml</code>:</p>
+<pre>Antes: - DB_POOL_SIZE=2
+Depois: - DB_POOL_SIZE=10</pre>
+<p>O valor 10 supera a concorrência observada de oito clientes e permite atender o pico de checkouts sem manter todas as conexões ocupadas.</p>
+<p>Aplicação:</p>
+<pre>docker compose up -d loja</pre>
+
+<h2>7. Prova da correção</h2>
+<p>Após a recriação do serviço e uma nova janela de coleta de dois minutos, cinco novas compras diretas retornaram:</p>
+<pre>200 0.952452s
+200 1.352133s
+200 0.973428s
+200 0.647404s
+200 0.573512s</pre>
+
+<table>
+<tr><th>Indicador</th><th>Antes</th><th>Depois</th><th>Resultado</th></tr>
+<tr><td>Taxa de erro no /checkout</td><td class="bad">29,56%</td><td class="ok">0%</td><td>Sem resultado 5xx na janela pós-correção</td></tr>
+<tr><td>p95 do /checkout</td><td class="bad">4,364 s</td><td class="ok">1,491 s</td><td>Redução para cerca do tempo normal da operação</td></tr>
+<tr><td>Conexões em uso</td><td>2 fixas</td><td>5 no instante medido</td><td>Pool passou a variar, mostrando folga</td></tr>
+<tr><td>Taxa aproximada do checkout</td><td>2,84 req/s</td><td>5,60 req/s</td><td>Aumento por não haver bloqueio e descarte na fila</td></tr>
+<tr><td>p95 de / e /produtos</td><td>48 ms / 206 ms</td><td>48 ms / 215 ms</td><td>Sem regressão relevante</td></tr>
+</table>
+
+<h3>Logs após a correção</h3>
+<p>O log <code>timeout ao obter conexão do pool do banco</code> deixou de aparecer na janela pós-correção. Os erros de recomendações e newsletter continuaram existindo, pois não estavam relacionados à causa do incidente.</p>
+
+<h2>8. Conclusão</h2>
+<p><b>Causa raiz:</b> saturação do pool do banco causada por <code>DB_POOL_SIZE=2</code>. Oito clientes concorrentes faziam o checkout esperar em fila; ultrapassados dois segundos, pedidos recebiam 500. Essa espera também elevava o p95 para cerca de 4,364 s.</p>
+<p><b>Correção:</b> elevar o pool para <code>DB_POOL_SIZE=10</code> eliminou a saturação observada.</p>
+<p><b>Prova:</b> a taxa de erro do checkout caiu de aproximadamente 29,56% para 0%, o p95 caiu para aproximadamente 1,491 s, cinco compras consecutivas tiveram status 200 e o valor da métrica de conexões passou a variar em vez de permanecer colado em 2.</p>
+
+<h2>9. Queries utilizadas</h2>
+<pre># Taxa por rota
+sum by (path) (rate(http_requests_total[1m]))
+
+# Taxa de erro por rota
+sum by (path) (rate(http_requests_total{status=~"5.."}[1m])) /
+sum by (path) (rate(http_requests_total[1m]))
+
+# p95 por rota
+histogram_quantile(0.95,
+  sum by (le, path) (rate(http_request_duration_seconds_bucket[1m])))
+
+# Conexões em uso
+db_conexoes_em_uso
+
+# Todos os logs da loja
+{container=~".+"}
+
+# Erros da loja
+{service="loja"} | json | level="ERROR"
+
+# Erros de checkout
+{service="loja"} | json | path="/checkout" | level="ERROR"</pre>
+
+<h2>10. Encerramento e limpeza</h2>
+<p>Com a atividade concluída, o ambiente pode ser retirado com <code>docker compose down</code>. Para apagar também os volumes históricos, usar <code>docker compose down -v</code>.</p>
+<p class="small">Fonte: Gist da atividade <code>Valgueiro/72ff3fda40a30e5c398183a01c97b724</code>; dados coletados localmente em 23/11/2026.</p>
+</body>
+</html>
